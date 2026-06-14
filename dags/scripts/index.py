@@ -21,6 +21,7 @@ def index_data(**kwargs):
     if not os.path.exists(local_combined):
         s3 = get_s3_client()
         os.makedirs(local_combined, exist_ok=True)
+        print(f"Downloading combined data from S3 for {execution_date}...")
         objs = s3.list_objects_v2(Bucket='datalake', Prefix=f"data/combined/analytics/air_quality_prediction/{execution_date}/")
         for obj in objs.get('Contents', []):
             if obj['Key'].endswith('.parquet'):
@@ -28,30 +29,70 @@ def index_data(**kwargs):
                 
     df = spark.read.parquet(local_combined)
     
-    # Connect to Elasticsearch
-    es = Elasticsearch("http://elasticsearch:9200")
+    # Connect to Elasticsearch with retries
+    # Using a list for hosts is more robust in 8.x
+    es = Elasticsearch(
+        ["http://elasticsearch:9200"],
+        request_timeout=30,
+        max_retries=10,
+        retry_on_timeout=True
+    )
     
     index_name = "air_quality_prediction"
     
-    # Create index if not exists
+    # Wait for ES to be ready (up to 30s)
+    import time
+    for i in range(6):
+        try:
+            if es.ping():
+                break
+        except Exception:
+            pass
+        print("Waiting for Elasticsearch...")
+        time.sleep(5)
+
+    # Create index if not exists with geo-point mapping
     if not es.indices.exists(index=index_name):
-        es.indices.create(index=index_name)
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "location": { "type": "geo_point" },
+                    "timestamp_utc": { "type": "date" },
+                    "weather_time": { "type": "date" },
+                    "value": { "type": "float" },
+                    "prediction": { "type": "float" },
+                    "temperature": { "type": "float" },
+                    "windspeed": { "type": "float" }
+                }
+            }
+        }
+        es.indices.create(index=index_name, body=mapping)
         
-    # Convert PySpark DataFrame to a list of dicts directly to avoid Pandas timezone issues
-    # Note: collect() brings all data to driver. Fine for this small dataset.
+    # Convert PySpark DataFrame to a list of dicts
     records = df.collect()
     
     count = 0
     for row in records:
         doc = row.asDict()
         
-        # Convert datetime objects to ISO strings for Elasticsearch
+        # Create geo_point field for Elasticsearch mapping
+        if 'latitude' in doc and 'longitude' in doc and doc['latitude'] is not None and doc['longitude'] is not None:
+            doc['location'] = {
+                "lat": float(doc['latitude']),
+                "lon": float(doc['longitude'])
+            }
+        
+        # Convert objects to JSON-friendly types
         for k, v in doc.items():
             if hasattr(v, 'isoformat'):
                 doc[k] = v.isoformat()
+            elif hasattr(v, 'to_eng_string'):
+                doc[k] = float(v)
+            elif hasattr(v, 'item'):
+                doc[k] = v.item()
                 
         es.index(index=index_name, document=doc)
         count += 1
         
-    print(f"Indexed {count} records into Elasticsearch.")
+    print(f"Successfully indexed {count} records into Elasticsearch.")
     spark.stop()

@@ -44,6 +44,8 @@ def format_data(**kwargs):
     if "current" in df_openaq.columns:
         df_openaq_clean = df_openaq.select(
             col("city_name"),
+            col("latitude"),
+            col("longitude"),
             col("current.pm2_5").alias("value"),
             col("current.pm10").alias("pm10"),
             to_timestamp(col("current.time")).alias("timestamp_utc")
