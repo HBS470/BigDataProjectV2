@@ -4,4 +4,3 @@ volume/
 __pycache__/
 *.pyc
 .venv/
-GEMENI.md
